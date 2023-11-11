@@ -1,13 +1,618 @@
 ---
 title: "analyses"
-author: "Kun"
+author: "Kun GUO (kguo@geo.ecnu.edu.cn)"
 date: 2023/11
 format: html
+editor_options: 
+  chunk_output_type: console
 ---
-# 0. packages
-
-
+# 0. library package
+```{r}
+library(tidyverse)
+library(tidybayes)
+library(ggdist)
+library(dtplyr)
+library(furrr)
+library(gghalves)
+library(readxl)
+library(corrplot)
+library(tictoc)
+library(Taxonstand)
+library(V.PhyloMaker)
+library(Rphylopars)
+library(RColorBrewer)
+library(taxize)
+library(data.table)
+library(brms)
+library(rlang)
+library(cmdstanr)
+library(loo)
+library(ggtext)
+library(ggnetwork)
+```
 # 1. load data
+```{r}
+load("WorldPlantInvasion_data.RData")
+holoploid.df
+holoploid.tree
+monoploid.df
+monoploid.tree
+fam2order
+```
+#2.1 construct data list for models
+```{r}
+# models for incidence
+# native vs. naturalized
+# naturalized extent, invasive extent
+
+# a function to transform data for ind models
+fn1 <- function(df, resp, tree){
+  tmp <- case_when(resp %in% c("native", "naturalized") ~ "native",
+                   resp == "invasive" ~ "naturalized"
+                   )
+  df |> 
+    # add incidence
+    mutate(ind = ifelse(status2==tmp, 0, 1)) |> 
+    # log-transform nat.rng
+    mutate(nat.rng = log(nat.rng)) |> 
+    mutate(holoploid = log(holoploid)) |> 
+    # scale all numeric data
+    mutate(across(c(c_score:holoploid,nat.rng, ecouse.sum), ~ (.x-mean(.x))/sd(.x))) |> 
+    # rearrange species names based on phy.tree
+    arrange(factor(TPL_name, levels = tree$tip.label)) |> 
+    rename(taxon = TPL_name) |> 
+    as.data.frame() |> return()
+}
+
+# a function to transform data for rng models
+fn2 <- function(df, resp, tree){
+  df |> 
+    # add incidence
+    # log-transform nat.rng
+    mutate(nat.rng = log(nat.rng)) |> 
+    mutate(natz.rng = log(natz.rng)) |> 
+    # NAs in ins.rng as 0
+    mutate(ins.rng = ifelse(is.na(ins.rng), 0, ins.rng)) |> 
+    mutate(ins.rng = log1p(ins.rng)) |> 
+    mutate(holoploid = log(holoploid)) |> 
+    # scale all numeric data
+    mutate(across(c(c_score:holoploid,nat.rng, natz.rng, ins.rng, ecouse.sum),
+                  ~ (.x-mean(.x,na.rm=T))/sd(.x, na.rm = T))) |> 
+    # rearrange species names based on phy.tree
+    arrange(factor(TPL_name, levels = tree$tip.label)) |> 
+    rename(taxon = TPL_name) |> 
+    as.data.frame() |> return()
+}
+
+# a function for ind formula
+ind.fmla <- function(csr){
+   paste0(
+      "bf(ind ~ ",csr, "+ ecouse.sum + nat.rng + holoploid + (1|gr(taxon, cov = phy.m.corr)), family = bernoulli(link = 'logit')) + ",
+      "bf(", csr , " ~  holoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "nat.rng ~", csr, "+ holoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "ecouse.sum ~", csr, "+ holoploid + nat.rng + (1|gr(taxon, cov = phy.m.corr)), family = gaussian())+
+      set_rescor(FALSE)
+      "
+      )
+}
 
 
-#
+# a function for naturalization range
+natz.fmla <- function(csr){
+  paste0(
+      "bf(natz.rng ~ ",csr, "+ ecouse.sum + nat.rng + holoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) + ",
+      "bf(", csr , " ~  holoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "nat.rng ~", csr, "+ holoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "ecouse.sum ~", csr, "+ holoploid + nat.rng + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) + set_rescor(FALSE)"
+      ) 
+  
+}
+
+# a function for invasion range
+ins.fmla <- function(csr){
+  paste0(
+      "bf(ins.rng ~ ",csr, "+ ecouse.sum + nat.rng + holoploid + natz.rng + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) + ",
+      "bf(", csr, " ~  holoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "nat.rng ~", csr, "+ holoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "natz.rng ~", csr, "+ nat.rng + ecouse.sum + holoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "ecouse.sum ~", csr, "+ holoploid + nat.rng + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) + set_rescor(FALSE)"
+      ) 
+  
+}
+
+holoploid.df.ls <- tibble(grp = list(c("native", "naturalized", "invasive"),
+                  c("naturalized", "invasive"),
+                  c("invasive") ),
+       type = rep(c("ind", "rng"), c(1, 2)),
+       resp = c("naturalized", "natz", "ins")
+       ) |> 
+  slice(rep(1:nrow(.), each =3)) |> 
+  mutate(csr = rep(paste0(c("c", "s", "r"), "_score"), 3)) |> 
+  mutate(grp1 = map_chr(grp, ~ paste(.x, collapse = ","))) |> 
+  # add identifiers to each model
+  # add data
+  mutate(df = map(grp, ~ filter(holoploid.df, status2 %in% .x))) |> 
+  # add tree
+  mutate(tree = map(df, ~ drop.tip(holoploid.tree, setdiff(holoploid.tree$tip.label, .x$TPL_name)))) |> 
+  # transform the data
+  mutate(df1 = pmap(list(df, resp, tree, type), function(x, y, z, t){
+    if (t == "ind"){
+      fn1(x, y, z)
+    } else {
+      fn2(x, y, z)
+    }
+  })) |> 
+  # construct formula 
+  mutate(fmla = pmap(list(type, resp, csr), function(x, y, z){
+    if (x=="ind"){
+      ind.fmla(z)
+    } else if (y == "ins"){
+      ins.fmla(z)
+    } else {
+      natz.fmla(z)
+    }
+  })) 
+  
+# check the data
+tmp <- holoploid.df.ls[1, ]
+tmp$tree[[1]]$tip.label[1:10]
+tmp$df1[[1]]$taxon[1:10]
+tmp$fmla[[1]]
+
+
+```
+#2.2 models
+```{r}
+plan("multisession", workers = 3)
+tic()
+list(holoploid.df.ls$type, holoploid.df.ls$resp, holoploid.df.ls$csr, 
+     holoploid.df.ls$df1,  holoploid.df.ls$tree,  holoploid.df.ls$fmla
+     ) |> 
+  future_pmap(function(v1, v2, v3, df, tr, fm){
+    library(cmdstanr)
+    library(brms)
+    library(rlang)
+    library(tictoc)
+    nm <- paste(v1, v2, v3, sep = ".")     
+    msg <- paste(Sys.time(), " running ", nm, "\n", sep=" ")
+    message(msg)
+    
+    row.names(df) <- df$taxon
+    
+    phy.m.corr <- ape::vcv(tr, corr=T)
+    
+     mod <- paste0(
+      "brm(",
+      fm,
+      ",data = df,
+      data2 = list(phy.m.corr= phy.m.corr),
+      chains = 4,
+      cores = 4,
+      control = list(adapt_delta = 0.99, max_treedepth = 15),
+      backend = 'cmdstanr',
+      threads = threading(4)
+      )
+      "
+      ) |>
+      parse_expr() |>
+      eval()
+
+    saveRDS(mod, file = paste0("./SEM_results/holoploid/", nm, ".sem.RDS"))
+    # return(mod)
+     
+     
+  }, .progress = T)
+toc()
+
+```
+
+
+
+#2.3 model results
+```{r}
+
+nm <- dir("./SEM_results/holoploid")
+nm1 <- str_remove(nm, ".RDS")
+
+holoploid.mod.ls <- map2(nm, nm1, function(x1, x2){
+  file <- paste0("./SEM_results/holoploid/", x1)
+  
+  paste0("readRDS('", file, "')") |> 
+    parse_expr() |> 
+    eval_bare()
+    
+  
+})
+names(holoploid.mod.ls) <- nm1
+
+# map(holoploid.mod.ls, summary)
+
+######## 
+# hypothesis testing
+plan(multisession, workers = 9)
+holoploid.mod.p <- future_map(nm, function(x){
+  file <- paste0("./SEM_results/holoploid/", x)
+  tmp <- readRDS(file)
+  tmp.fix <-fixef(tmp) |> 
+    as.data.frame() |> 
+    rownames_to_column("path") |> 
+    filter(!str_detect(path, "Intercept")) |> 
+    mutate(dir = ifelse(Estimate > 0, " > 0", " < 0")) |> 
+    mutate(hyp = paste0(path, dir)) |> 
+    as_tibble() |> 
+    mutate(hyp.test = map(hyp, ~ hypothesis(tmp, .x))) 
+  return(tmp.fix)
+}, .progress = T)
+gc()
+plan(sequential)
+
+holoploid.mod.p1 <- tibble(type = word(nm1, 1, sep= "\\."),
+                          resp = word(nm1, 2, sep= "\\."),
+                          csr = word(nm1, 3, sep= "\\.")
+                          ) |> 
+  mutate(mod.summ = holoploid.mod.p) |> 
+  unnest(mod.summ) |> 
+  mutate(hyp.test1 = map(hyp.test, "hypothesis")) |> 
+  select(type:path, hyp.test1) |> 
+  unnest(hyp.test1)
+
+holoploid.mod.p1 |> 
+  select(type:Estimate, Post.Prob, Star) 
+
+#################
+# visualize sem
+###########
+# a data frame specify the position of vertec.names
+holoploid.mod.p2 <- holoploid.mod.p1 |> 
+  select(type:CI.Upper, Post.Prob) |> 
+  mutate(from = word(path, 2, sep = "_"), .after = 1) |>
+  mutate(to = word(path, 1, sep = "_"), .after = 2) |> 
+  mutate(
+    from = case_when(
+      from == "c" ~ "cscore",
+      from == "s" ~ "sscore",
+      from == "r" ~ "rscore",
+      from == "ecouse.sum" ~ "ecousesum",
+      from =="nat.rng" ~ "natrng",
+      T ~ from
+    ))
+
+library(ggdag)
+v.pos <- tribble(
+  ~ vertex.names, ~ x, ~ y,
+  "monoploid", 3, 6,
+  "holoploid", 3, 6,
+  "natrng", 0, 3,
+  "cscore", 3, 3,
+  "sscore", 3, 3,
+  "rscore", 3, 3,
+  "ecousesum", 6, 3,
+  "ind", 3, 0,
+  "natzrng", 3, 0,
+  "insrng", 3, 0
+)
+
+v.pos.x <- v.pos$x
+names(v.pos.x) <- v.pos$vertex.names
+v.pos.y <- v.pos$y
+names(v.pos.y) <- v.pos$vertex.names
+
+################
+# generate x, y, xend, yend
+holoploid.mod.p3 <- holoploid.mod.p2 |> 
+  mutate(x=v.pos.x[from], y=v.pos.y[from],
+         xend=v.pos.x[to], yend=v.pos.y[to],
+         .after = 3) |> 
+  # select(1:11) |> 
+  # sig or not
+  rename(lowerci="CI.Lower", upperci="CI.Upper") |> 
+  mutate(sig=ifelse(lowerci*upperci>0, "sig", "non_sig")) |> 
+  # edge color
+  mutate(edge.color = ifelse(Estimate > 0, "pos", "neg")) |> 
+  # curvature
+  mutate(curv=ifelse(from=="holoploid" & (to %in% c("ind", "natzrng", "insrng")), 0.9, 0)) |> 
+  mutate(lab = paste0(ecoloop::specify_decimal(Estimate, 3), "\n", 
+                      # ecoloop::specify_decimal(lowerci, 3), ", ",
+                      # ecoloop::specify_decimal(upperci, 3), "]\nP=",
+                      ecoloop::specify_decimal(Post.Prob, 3))) |> 
+  mutate(type = factor(type, levels = c("ind", "rng"))) |> 
+  mutate(resp = factor(resp, levels = c("naturalized", "natz", "ins"))) |> 
+  mutate(csr = factor(csr, levels = paste0(c("c", "s", "r"), "_score")))
+
+holoploid.mod.p3  |>
+  ggplot(aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(arrow = arrow(length = unit(3, "pt")),
+             aes(linetype=sig, color=edge.color),
+             curvature = 0.1,
+             show.legend = F
+             ) +
+  geom_edgetext_repel(aes(label = lab,color=edge.color),
+                      label.size = NA, fill=NA, max.overlaps = 20, 
+                      show.legend = F)+
+  facet_grid(type+resp ~ csr)+
+  ggtitle("holoploid")+
+  scale_color_manual(values = c(pos="#154272", neg="#e32420"))+
+  scale_linetype_manual(values = c(sig="solid", non_sig="dashed"))+
+  theme_blank()
+
+```
+#3.0 data with monoploid genome size
+```{r}
+monoploid.df 
+monoploid.tree
+
+```
+#3.1 construct data list for models
+```{r}
+# models for incidence
+# native vs. naturalized
+# naturalized extent, invasive extent
+
+# a function to transform data for ind models
+fn1 <- function(df, resp, tree){
+  tmp <- case_when(resp %in% c("native", "naturalized") ~ "native",
+                   resp == "invasive" ~ "naturalized"
+                   )
+  df |> 
+    # add incidence
+    mutate(ind = ifelse(status2==tmp, 0, 1)) |> 
+    # log-transform nat.rng
+    mutate(nat.rng = log(nat.rng)) |> 
+    mutate(monoploid = log(monoploid)) |> 
+    mutate(natz.rng = log(natz.rng)) |> 
+    # scale all numeric data
+    mutate(across(c(c_score:monoploid, nat.rng, ecouse.sum), ~ (.x-mean(.x))/sd(.x))) |> 
+    # rearrange species names based on phy.tree
+    arrange(factor(TPL_name, levels = tree$tip.label)) |> 
+    rename(taxon = TPL_name) |> 
+    as.data.frame() |> return()
+}
+
+# a function to transform data for rng models
+fn2 <- function(df, resp, tree){
+  df |> 
+    # add incidence
+    # log-transform nat.rng
+    mutate(nat.rng = log(nat.rng)) |> 
+    mutate(monoploid = log(monoploid)) |> 
+    mutate(natz.rng = log(natz.rng)) |> 
+    # scale all numeric data
+    mutate(across(c(c_score:monoploid,nat.rng, natz.rng, ins.rng, ecouse.sum),
+                  ~ (.x-mean(.x,na.rm=T))/sd(.x, na.rm = T))) |> 
+    # rearrange species names based on phy.tree
+    arrange(factor(TPL_name, levels = tree$tip.label)) |> 
+    # right_join(data.frame(TPL_name = tree$tip.label), "TPL_name") |> 
+    rename(taxon = TPL_name) |> 
+    as.data.frame() |> return()
+}
+
+# a function for ind formula
+ind.fmla <- function(csr){
+   paste0(
+      "bf(ind ~ ",csr, "+ ecouse.sum + nat.rng + monoploid + (1|gr(taxon, cov = phy.m.corr)), family = bernoulli(link = 'logit')) + ",
+      "bf(", csr , " ~  monoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "nat.rng ~", csr, "+ monoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "ecouse.sum ~", csr, "+ monoploid + nat.rng + (1|gr(taxon, cov = phy.m.corr)), family = gaussian())+
+      set_rescor(FALSE)
+      "
+      )
+}
+
+
+# a function for naturalization range
+natz.fmla <- function(csr){
+  paste0(
+      "bf(natz.rng ~ ",csr, "+ ecouse.sum + nat.rng + monoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) + ",
+      "bf(", csr , " ~  monoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "nat.rng ~", csr, "+ monoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "ecouse.sum ~", csr, "+ monoploid + nat.rng + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) + set_rescor(FALSE)"
+      ) 
+  
+}
+
+# a function for invasion range
+ins.fmla <- function(csr){
+  paste0(
+      "bf(ins.rng ~ ",csr, "+ ecouse.sum + nat.rng + monoploid + natz.rng + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) + ",
+      "bf(", csr, " ~  monoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "nat.rng ~", csr, "+ monoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "natz.rng ~", csr, "+ nat.rng + ecouse.sum + monoploid + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) +",
+      "bf(",  "ecouse.sum ~", csr, "+ monoploid + nat.rng + (1|gr(taxon, cov = phy.m.corr)), family = gaussian()) + set_rescor(FALSE)"
+      ) 
+  
+}
+
+monoploid.df.ls <- tibble(grp = list(c("native", "naturalized", "invasive"),
+                  c("naturalized", "invasive"),
+                  c("invasive") ),
+       type = rep(c("ind", "rng"), c(1, 2)),
+       resp = c("naturalized", "natz", "ins")
+       ) |> 
+  slice(rep(1:nrow(.), each =3)) |> 
+  mutate(csr = rep(paste0(c("c", "s", "r"), "_score"), 3)) |> 
+  mutate(grp1 = map_chr(grp, ~ paste(.x, collapse = ","))) |> 
+  # add identifiers to each model
+  # add data
+  mutate(df = map(grp, ~ filter(monoploid.df, status2 %in% .x))) |> 
+  # add tree
+  mutate(tree = map(df, ~ drop.tip(monoploid.tree, setdiff(monoploid.tree$tip.label, .x$TPL_name)))) |> 
+  # transform the data
+  mutate(df1 = pmap(list(df, resp, tree, type), function(x, y, z, t){
+    if (t == "ind"){
+      fn1(x, y, z)
+    } else {
+      fn2(x, y, z)
+    }
+  })) |> 
+  # construct formula 
+  mutate(fmla = pmap(list(type, resp, csr), function(x, y, z){
+    if (x=="ind"){
+      ind.fmla(z)
+    } else if (y == "ins"){
+      ins.fmla(z)
+    } else {
+      natz.fmla(z)
+    }
+  })) 
+
+tmp <- monoploid.df.ls[1, ]
+tmp$tree[[1]]$tip.label[1:10]
+tmp$df1[[1]]$taxon[1:10]
+tmp$fmla[[1]]
+
+```
+#3.2 models
+```{r}
+
+plan("multisession", workers = 9)
+tic()
+list(monoploid.df.ls$type, monoploid.df.ls$resp, monoploid.df.ls$csr, 
+     monoploid.df.ls$df1,  monoploid.df.ls$tree, monoploid.df.ls$fmla
+     ) |>
+  future_pmap(function(v1, v2, v3, df, tr, fm){
+    library(cmdstanr)
+    library(brms)
+    library(rlang)
+    library(tictoc)
+    nm <- paste(v1, v2, v3, sep = ".")     
+    msg <- paste(Sys.time(), " running ", nm, "\n", sep=" ")
+    message(msg)
+    
+    row.names(df) <- df$taxon
+    
+    phy.m.corr <- ape::vcv(tr, corr=T)
+    
+     mod <- paste0(
+      "brm(",
+      fm,
+      ",data = df,
+      data2 = list(phy.m.corr= phy.m.corr),
+      chains = 4,
+      cores = 4,
+      control = list(adapt_delta = 0.99, max_treedepth = 15),
+      backend = 'cmdstanr',
+      threads = threading(4)
+      )
+      "
+      ) |>
+      parse_expr() |>
+      eval()
+
+    saveRDS(mod, file = paste0("./SEM_results/monoploid/monoploid.",nm, ".sem.RDS"))
+    # return(mod)
+     
+     
+  }, .progress = T)
+toc()
+plan("sequential")
+
+
+```
+
+
+
+#3.3 model results tidy.brms
+```{r}
+
+nm <- dir("./SEM_resuls/monoploid")
+nm1 <- str_remove(nm, ".RDS")
+
+monoploid.mod.ls <- map2(nm, nm1, function(x1, x2){
+  file <- paste0("./SEM_resuls/monoploid/", x1)
+  
+  paste0("readRDS('", file, "')") |> 
+    parse_expr() |> 
+    eval_bare()
+    
+  
+})
+names(monoploid.mod.ls) <- nm1
+
+######## 
+# hypothesis testing
+plan(multisession, workers = 9)
+monoploid.mod.p <- future_map(nm, function(x){
+  file <- paste0("./SEM_resuls/monoploid/", x)
+  tmp <- readRDS(file)
+  tmp.fix <-fixef(tmp) |> 
+    as.data.frame() |> 
+    rownames_to_column("path") |> 
+    filter(!str_detect(path, "Intercept")) |> 
+    mutate(dir = ifelse(Estimate > 0, " > 0", " < 0")) |> 
+    mutate(hyp = paste0(path, dir)) |> 
+    as_tibble() |> 
+    mutate(hyp.test = map(hyp, ~ hypothesis(tmp, .x))) 
+  return(tmp.fix)
+}, .progress = T)
+gc()
+plan(sequential)
+
+monoploid.mod.p1 <- tibble(type = word(nm1, 2, sep= "\\."),
+                          resp = word(nm1, 3, sep= "\\."),
+                          csr = word(nm1, 4, sep= "\\.")
+                          ) |> 
+  mutate(mod.summ = monoploid.mod.p) |> 
+  unnest(mod.summ) |> 
+  mutate(hyp.test1 = map(hyp.test, "hypothesis")) |> 
+  select(type:path, hyp.test1) |> 
+  unnest(hyp.test1)
+
+monoploid.mod.p1 |> 
+  select(type:Estimate, Post.Prob, Star) |> 
+  as.data.frame()
+
+#################
+# visualize sem
+# generate x, y, xend, yend
+monoploid.mod.p2 <- monoploid.mod.p1 |> 
+  select(type:CI.Upper, Post.Prob) |> 
+  mutate(from = word(path, 2, sep = "_"), .after = 1) |>
+  mutate(to = word(path, 1, sep = "_"), .after = 2) |> 
+  mutate(
+    from = case_when(
+      from == "c" ~ "cscore",
+      from == "s" ~ "sscore",
+      from == "r" ~ "rscore",
+      from == "ecouse.sum" ~ "ecousesum",
+      from =="nat.rng" ~ "natrng",
+      T ~ from
+    ))
+
+monoploid.mod.p3 <- monoploid.mod.p2 |> 
+  mutate(x=v.pos.x[from], y=v.pos.y[from],
+         xend=v.pos.x[to], yend=v.pos.y[to],
+         .after = 3) |> 
+  # sig or not
+  rename(lowerci="CI.Lower", upperci="CI.Upper") |> 
+  mutate(sig=ifelse(lowerci*upperci>0, "sig", "non_sig")) |> 
+  # edge color
+  mutate(edge.color = ifelse(Estimate > 0, "pos", "neg")) |> 
+  # curvature
+  mutate(curv=ifelse(from=="holoploid" & (to %in% c("ind", "natzrng", "insrng")), 0.9, 0)) |> 
+  mutate(lab = paste0(ecoloop::specify_decimal(Estimate, 3), "\n", 
+                      ecoloop::specify_decimal(Post.Prob, 3))) |> 
+  mutate(type = factor(type, levels = c("ind", "rng"))) |> 
+  mutate(resp = factor(resp, levels = c("native", "naturalized", "invasive", "alien","natz", "ins"))) |> 
+  mutate(csr = factor(csr, levels = paste0(c("c", "s", "r"), "_score")))
+
+pdf("monoploid.sem.pdf", width = 10, height = 16)
+monoploid.mod.p3  |>
+  ggplot(aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(arrow = arrow(length = unit(3, "pt")),
+             aes(linetype=sig, color=edge.color),
+             curvature = 0.1,
+             show.legend = F
+             ) +
+  geom_edgetext_repel(aes(label = lab,color=edge.color),
+                      label.size = NA, fill=NA, max.overlaps = 20, 
+                      show.legend = F)+
+  facet_grid(type+resp ~ csr)+
+  ggtitle("monoploid")+
+  scale_color_manual(values = c(pos="#154272", neg="#e32420"))+
+  scale_linetype_manual(values = c(sig="solid", non_sig="dashed"))+
+  theme_blank()
+dev.off()
+
+```
+
+
