@@ -1,8 +1,7 @@
 # WorldPlantInvasion [![DOI](https://zenodo.org/badge/716638649.svg)](https://zenodo.org/doi/10.5281/zenodo.10113290)
 Data and code for the paper: 
 
->Kun Guo, Petr Pyšek, Mark van Kleunen, Nicole L. Kinlock, Magdalena Lučanová, Ilia J. Leitch, Simon Pierce, Wayne Dawson, Franz Essl, Holger Kreft, Bernd Lenzner, Jan Perg, Patrick Weigelt, Wen-Yong Guo. 2023. [Plant invasion and naturalization are inﬂuenced by genome size, ecology and
-economic use globally](https://www.researchsquare.com/article/rs-3132244/v1). (accepted).
+>Kun Guo, Petr Pyšek, Mark van Kleunen, Nicole L. Kinlock, Magdalena Lučanová, Ilia J. Leitch, Simon Pierce, Wayne Dawson, Franz Essl, Holger Kreft, Bernd Lenzner, Jan Perg, Patrick Weigelt, Wen-Yong Guo. 2024. [Plant invasion and naturalization are inﬂuenced by genome size, ecology and economic use globally](https://doi.org/10.1038/s41467-024-45667-4). Nature Communications, 15, 1330.
 
 How to use
 
